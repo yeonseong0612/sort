@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp -r /home/yskim/projects/sort/CFG /home/yskim/projects/sort/raw/CFG)",
+      "Bash(cp -r /home/yskim/projects/sort/tracker /home/yskim/projects/sort/raw/tracker)",
+      "Bash(cp /home/yskim/projects/sort/test_synthetic.py /home/yskim/projects/sort/raw/)",
+      "Bash(mkdir -p /home/yskim/projects/sort/claude)",
+      "Bash(mkdir -p /home/yskim/projects/sort/raw)",
+      "Bash(PYTHONPATH=/home/yskim/projects/sort /home/yskim/miniconda3/envs/sort/bin/python *)"
+    ]
+  }
+}
