@@ -44,9 +44,11 @@ class MotionReID:
         for r, c in enumerate(col_ind):
             if c < 0:
                 continue
+            # r이 행 범위, c가 열 범위인지 확인
+            if r >= dist_np.shape[0] or c >= dist_np.shape[1]:
+                continue
             if dist_np[r, c] > self.max_reid_dist:
                 continue
-            # candidates[r] → original index in lost_tracks
             original_idx = lost_tracks.index(candidates[r])
             matched.append((original_idx, c))
 

@@ -119,7 +119,7 @@ class KalmanFilter:
         innovation,
         score=None,
         min_scale=1.0,
-        max_scale=10.0,
+        max_scale=3.0,
         residual_ref=20.0
     ):
         """
@@ -180,6 +180,12 @@ class KalmanFilter:
 
         B = covariance @ self._update_mat.T
 
+        jitter = 1e-4
+        projected_cov = projected_cov + jitter * torch.eye(
+            projected_cov.shape[-1],
+            device=projected_cov.device
+        ).unsqueeze(0).expand_as(projected_cov)
+
         L = torch.linalg.cholesky(projected_cov)
 
         kalman_gain = torch.cholesky_solve(
@@ -196,6 +202,13 @@ class KalmanFilter:
         new_covariance = covariance - (
             kalman_gain @ projected_cov @ kalman_gain.transpose(1, 2)
         )
+
+        # 대칭성 강제 + 수치 안정화
+        new_covariance = (new_covariance + new_covariance.transpose(1, 2)) / 2
+        new_covariance = new_covariance + 1e-6 * torch.eye(
+            new_covariance.shape[-1],
+            device=new_covariance.device
+        ).unsqueeze(0).expand_as(new_covariance)
 
         return new_mean, new_covariance
     

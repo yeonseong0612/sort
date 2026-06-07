@@ -16,7 +16,7 @@ class Tracker:
         high_thresh=0.5,
         low_thresh=0.1,
         match_thresh=0.7,
-        max_lost=30,
+        max_lost=3,
         use_gmc=True,
         gmc_min_pairs=2,
         gmc_max_shift=50.0
