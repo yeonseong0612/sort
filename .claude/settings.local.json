@@ -6,7 +6,9 @@
       "Bash(cp /home/yskim/projects/sort/test_synthetic.py /home/yskim/projects/sort/raw/)",
       "Bash(mkdir -p /home/yskim/projects/sort/claude)",
       "Bash(mkdir -p /home/yskim/projects/sort/raw)",
-      "Bash(PYTHONPATH=/home/yskim/projects/sort /home/yskim/miniconda3/envs/sort/bin/python *)"
+      "Bash(PYTHONPATH=/home/yskim/projects/sort /home/yskim/miniconda3/envs/sort/bin/python *)",
+      "Bash(conda run *)",
+      "Bash(PYTORCH_ENABLE_MPS_FALLBACK=1 conda run *)"
     ]
   }
 }

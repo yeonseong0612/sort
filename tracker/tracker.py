@@ -4,6 +4,7 @@ from tracker.kalman_filter import KalmanFilter
 from tracker.track import Track, TrackState
 from tracker.association import iou_distance, linear_assignment
 from tracker.motion_statistics import compute_bbox_shifts, robust_global_shift, apply_global_shift
+from tracker.neighbor_imputation import NeighborImputation
 
 
 
@@ -19,6 +20,7 @@ class Tracker:
         gmc_max_shift=50.0
     ):
         self.kf = KalmanFilter()
+        self.imputation = NeighborImputation(k=7)
 
         self.tracked_tracks = []
         self.lost_tracks = []
@@ -166,6 +168,14 @@ class Tracker:
             else:
                 lost_tracks.append(track)
 
+        # 7.5. neighbor imputation for lost tracks
+        for track in lost_tracks:
+            if track.state == TrackState.Lost:
+                track.start_occlusion()
+            if track.state == TrackState.OcclusionImputed:
+                imputed_pos = self.imputation.impute(track, activated_tracks)
+                track.add_imputed_position(imputed_pos)
+
         # 8. update track pools
         self.tracked_tracks = [
             t for t in activated_tracks
@@ -174,7 +184,7 @@ class Tracker:
 
         self.lost_tracks = [
             t for t in lost_tracks
-            if t.state == TrackState.Lost
+            if t.state in (TrackState.Lost, TrackState.OcclusionImputed)
         ]
 
         self.removed_tracks.extend(removed_tracks)

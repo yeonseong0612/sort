@@ -127,3 +127,37 @@ pytest
 - `cfg.device = 'cuda'` 하드코딩 — CPU 환경에서는 `CFG/cfg.py` 수정 필요
 - `association.py`의 `iou_distance`는 GPU 계산 후 `.cpu().numpy()` 반환 (lap이 numpy 요구)
 - `KalmanFilter.update`에서 Q scaling 적용 후 covariance를 **in-place 대입** — 원본 covariance는 변경됨
+
+
+## 개발 방향 (점진적 수정)
+
+### 핵심 원칙
+- 기존 동작 절대 유지 (Adaptive Kalman, 2단계 association, GMC)
+- 칼만 상태벡터 [x,y,w,h,vx,vy,vw,vh] 8차원 그대로 유지
+- 새 기능은 추가만, 기존 로직 수정 최소화
+
+### 1단계 작업 목록
+
+**track.py**
+- TrackState에 OcclusionImputed 추가
+- Track 필드 추가: occluded_frames, imputed_positions,
+  neighbor_ids, last_observed_velocity
+- 메서드 추가: start_occlusion(), add_imputed_position(), clear_occlusion()
+
+**tracker/neighbor_imputation.py (신규)**
+- NeighborImputation 클래스
+- get_neighbors(): 유클리드 거리 기준 k개 이웃 탐색 (기본 k=7)
+- compute_neighbor_velocity(): 이웃 평균 (vx, vy)
+- impute(): 잔차 구조 — 칼만 예측 + 이웃 평균 속도 보정
+  - 이웃 없으면 칼만 예측으로 자동 폴백
+
+**tracker.py**
+- Tracker.__init__에 self.imputation = NeighborImputation(k=7) 추가
+- update() 내 Lost 처리 직후에 이웃 보완 블록 추가
+- Lost → Tracked 재연결 시 clear_occlusion() 호출
+
+### 배경 (연구 컨텍스트)
+- 조류 군집 추적에서 외형 Re-ID 무용 → 운동 기반으로 전환
+- 가림 중 이웃 새들의 변위로 가려진 새 위치 보완
+- 잔차 구조: x_imputed = x_kalman + alpha*(v_neighbor - v_self)
+- alpha=0.5 (초기값, 추후 게이팅 네트워크로 대체 예정)
