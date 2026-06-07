@@ -199,6 +199,9 @@ class KalmanFilter:
 
         return new_mean, new_covariance
     
+    def get_uncertainty(self, covariance: torch.Tensor) -> float:
+        return covariance[:2, :2].trace().item()
+
     def gating_distance(self, mean, covariance, measurements):
         projected_mean, projected_cov = self.project(mean, covariance)
 

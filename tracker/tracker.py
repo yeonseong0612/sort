@@ -5,6 +5,8 @@ from tracker.track import Track, TrackState
 from tracker.association import iou_distance, linear_assignment
 from tracker.motion_statistics import compute_bbox_shifts, robust_global_shift, apply_global_shift
 from tracker.neighbor_imputation import NeighborImputation
+from tracker.gating_network import GatingNetwork
+from tracker.motion_reid import MotionReID
 
 
 
@@ -21,6 +23,8 @@ class Tracker:
     ):
         self.kf = KalmanFilter()
         self.imputation = NeighborImputation(k=7)
+        self.gating = GatingNetwork()
+        self.motion_reid = MotionReID(max_reid_dist=50.0)
 
         self.tracked_tracks = []
         self.lost_tracks = []
@@ -155,13 +159,35 @@ class Tracker:
             track.mark_lost()
             lost_tracks.append(track)
 
-        # 6. unmatched high-score detections -> new tracks
+        # ============================================================
+        # 6.5 운동 Re-ID: OcclusionImputed 트랙 ↔ 매칭 안 된 high_dets
+        # ============================================================
+        occluded_tracks = [t for t in self.lost_tracks if t.state == TrackState.OcclusionImputed]
+        unmatched_new_dets = [high_det_tracks[i] for i in unmatched_high_dets]
+
+        reid_matches = self.motion_reid.match(occluded_tracks, unmatched_new_dets)
+
+        reid_recovered_track_ids = set()
+        reid_consumed_det_indices = set()
+
+        for t_idx, d_idx in reid_matches:
+            track = occluded_tracks[t_idx]
+            det = unmatched_new_dets[d_idx]
+            track.update(self.kf, det.mean[:4], det.score, self.frame_id)
+            activated_tracks.append(track)
+            reid_recovered_track_ids.add(track.track_id)
+            reid_consumed_det_indices.add(d_idx)
+
+        # 6. Re-ID로 소비되지 않은 unmatched high-score detections → 새 트랙
         for d_idx in unmatched_high_dets:
+            if d_idx in reid_consumed_det_indices:
+                continue
             det = high_det_tracks[d_idx]
             activated_tracks.append(det)
-
-        # 7. previous lost track management
+        # 7. previous lost track management (Re-ID로 복구된 트랙 제외)
         for track in self.lost_tracks:
+            if track.track_id in reid_recovered_track_ids:
+                continue
             if self.frame_id - track.frame_id > self.max_lost:
                 track.mark_removed()
                 removed_tracks.append(track)
@@ -172,9 +198,9 @@ class Tracker:
         for track in lost_tracks:
             if track.state == TrackState.Lost:
                 track.start_occlusion()
-            if track.state == TrackState.OcclusionImputed:
-                imputed_pos = self.imputation.impute(track, activated_tracks)
-                track.add_imputed_position(imputed_pos)
+            # Lost → OcclusionImputed 전환 후 바로 보완 실행
+            imputed_pos = self.imputation.impute(track, activated_tracks, self.gating)
+            track.add_imputed_position(imputed_pos)
 
         # 8. update track pools
         self.tracked_tracks = [

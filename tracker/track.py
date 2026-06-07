@@ -97,6 +97,12 @@ class Track:
     def mark_removed(self):
         self.state = TrackState.Removed
 
+    def get_uncertainty(self) -> float:
+        base = self.covariance[:2, :2].trace().item()
+        if self.state in (TrackState.Lost, TrackState.OcclusionImputed):
+            base *= (1.0 + self.occluded_frames * 0.1)
+        return base
+
     def to_xywh(self):
         return self.mean[:4]
 
