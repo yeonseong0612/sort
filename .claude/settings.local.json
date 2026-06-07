@@ -17,7 +17,19 @@
       "Bash(conda env *)",
       "Bash(/home/yskim/miniconda3/envs/sort/bin/python *)",
       "Bash(pip install *)",
-      "Bash(pip3 show *)"
+      "Bash(pip3 show *)",
+      "Bash(mkdir -p src/tracker src/data src/evaluation src/visualization)",
+      "Bash(touch src/__init__.py src/tracker/__init__.py src/data/__init__.py src/evaluation/__init__.py src/visualization/__init__.py)",
+      "Bash(mkdir -p checkpoint)",
+      "Bash(cp tracker/association.py src/tracker/association.py)",
+      "Bash(cp tracker/gating_network.py src/tracker/gating_network.py)",
+      "Bash(cp tracker/kalman_filter.py src/tracker/kalman_filter.py)",
+      "Bash(cp tracker/motion_reid.py src/tracker/motion_reid.py)",
+      "Bash(cp tracker/motion_statistics.py src/tracker/motion_statistics.py)",
+      "Bash(conda activate *)",
+      "Bash(python3 -c \"import torch; print\\(torch.__version__\\)\")",
+      "Bash(python3 *)",
+      "Bash(/home/yskim/miniconda3/envs/sort/bin/python3 *)"
     ]
   }
 }

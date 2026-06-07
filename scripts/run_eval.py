@@ -5,11 +5,11 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from scripts.gt_loader import GTLoader
-from evaluation.mot_eval import FrameEvaluator
-from visualization.vis_tracks import TrackVisualizer
-from tracker.tracker import Tracker
-from tracker.track import TrackState
+from src.data.gt_loader import GTLoader
+from src.evaluation.mot_eval import FrameEvaluator
+from src.visualization.vis_tracks import TrackVisualizer
+from src.tracker.tracker import Tracker
+from src.tracker.track import TrackState
 
 
 def parse_args():
