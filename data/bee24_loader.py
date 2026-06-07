@@ -41,7 +41,7 @@ class BEE24Dataset(Dataset):
     ):
         self.data_root = data_root
         self.split = split
-        self.mask_lengths = mask_lengths or [5, 10, 20, 40]
+        self.mask_lengths = [10]
         self.mask_ratio = mask_ratio
         self.min_track_len = min_track_len
         self.k = k
@@ -59,6 +59,7 @@ class BEE24Dataset(Dataset):
 
         # 마스킹 샘플: [(track_uid, mask_start_idx, mask_len), ...]
         self.samples = self._build_samples()
+        
 
     # ── 시퀀스 목록 구성 ──────────────────────────────────────────────────
 
@@ -205,43 +206,52 @@ class BEE24Dataset(Dataset):
         vels: list = info["vels"]
         seq_name: str = info["seq_name"]
 
-        obs    = dets[:mask_start]
-        masked = dets[mask_start: mask_start + mask_len]
+        obs      = dets[:mask_start]
+        masked   = dets[mask_start: mask_start + mask_len]
         obs_vels = vels[:mask_start]
 
         # 마지막 관측 속도
         vx_last, vy_last = obs_vels[-1] if obs_vels else (0.0, 0.0)
 
-        # target_before: (T_obs, 6)  [cx, cy, vx, vy, w, h]
+        # ── target_before: 고정 길이 obs_len으로 자르기 ──────────────
+        OBS_LEN = 10  # 가림 직전 고정 관측 길이
+        pairs = list(zip(obs, obs_vels))
+
+        if len(pairs) >= OBS_LEN:
+            pairs = pairs[-OBS_LEN:]          # 마지막 OBS_LEN개만
+        else:
+            # 부족하면 앞을 0으로 패딩
+            pad_n = OBS_LEN - len(pairs)
+            dummy_det = (0, 0.0, 0.0, 0.0, 0.0)
+            dummy_vel = (0.0, 0.0)
+            pairs = [(dummy_det, dummy_vel)] * pad_n + pairs
+
         target_before = torch.tensor(
             [[cx, cy, vx, vy, w, h]
-             for (_, cx, cy, w, h), (vx, vy) in zip(obs, obs_vels)],
+            for (_, cx, cy, w, h), (vx, vy) in pairs],
             dtype=torch.float32,
-        )
+        )  # → 항상 (OBS_LEN, 6) = (10, 6)
 
-        # target_gt: (T_mask, 2)  [cx, cy]
+        # ── target_gt: (T_mask, 2) ───────────────────────────────────
         target_gt = torch.tensor(
             [[cx, cy] for _, cx, cy, _, _ in masked],
             dtype=torch.float32,
         )
 
-        # 칼만 예측: 등속도 외삽 (fps 단위 속도 → 프레임 단위로 /fps)
+        # ── 칼만 예측: 등속도 외삽 ───────────────────────────────────
         cx_last, cy_last = obs[-1][1], obs[-1][2]
-        # vx_last, vy_last는 px/s 단위이므로 1프레임 = 1/fps 초
-        # 단순 외삽: cx_kalman(t) = cx_last + vx_last * t (t는 프레임 수)
-        # (fps 단위 속도 * t프레임 / fps = 픽셀 변위)
         fps = self._get_fps_for_track(track_uid)
         kalman_pred = torch.tensor(
             [[cx_last + vx_last * t / fps,
-              cy_last + vy_last * t / fps]
-             for t in range(1, mask_len + 1)],
+            cy_last + vy_last * t / fps]
+            for t in range(1, mask_len + 1)],
             dtype=torch.float32,
-        )
+        )  # (T_mask, 2)
 
-        # kalman_uncertainty: 가림 길이에 비례하는 근사값
+        # ── kalman_uncertainty ───────────────────────────────────────
         kalman_uncertainty = _BASE_VAR * (1.0 + mask_len * 0.1)
 
-        # 이웃 탐색: 마스킹 시작 프레임, 같은 시퀀스
+        # ── 이웃 탐색 ────────────────────────────────────────────────
         frame_start = masked[0][0]
         target_cx, target_cy = masked[0][1], masked[0][2]
 
@@ -255,15 +265,14 @@ class BEE24Dataset(Dataset):
         )
         candidates = candidates[: self.k]
 
-        # neighbors: (k, T_mask, 4)  [cx, cy, vx, vy]
-        neighbors    = torch.zeros(self.k, mask_len, 4, dtype=torch.float32)
-        neighbor_mask = torch.zeros(self.k, dtype=torch.float32)
+        # ── neighbors: (k, T_mask, 4) ────────────────────────────────
+        neighbors     = torch.zeros(self.k, mask_len, 4, dtype=torch.float32)
+        neighbor_mask = torch.zeros(self.k,           dtype=torch.float32)
 
         for ni, (n_uid, _, _) in enumerate(candidates):
-            n_info  = self.tracks[n_uid]
-            n_dets  = n_info["dets"]
-            n_vels  = n_info["vels"]
-            n_fps   = self._get_fps_for_track(n_uid)
+            n_info = self.tracks[n_uid]
+            n_dets = n_info["dets"]
+            n_vels = n_info["vels"]
 
             n_frame_map = {f: (cx, cy, w, h) for f, cx, cy, w, h in n_dets}
             n_vel_map   = {f: vv for (f, *_), vv in zip(n_dets, n_vels)}
@@ -281,15 +290,15 @@ class BEE24Dataset(Dataset):
         vel_magnitude = float((vx_last ** 2 + vy_last ** 2) ** 0.5)
 
         return {
-            "target_before":      target_before,                            # (T_obs, 6)
-            "target_gt":          target_gt,                                # (T_mask, 2)
-            "neighbors":          neighbors,                                # (k, T_mask, 4)
-            "neighbor_mask":      neighbor_mask,                            # (k,)
-            "kalman_pred":        kalman_pred,                              # (T_mask, 2)
+            "target_before":      target_before,          # (10, 6)  ← 고정
+            "target_gt":          target_gt,               # (T_mask, 2)
+            "neighbors":          neighbors,               # (k, T_mask, 4)
+            "neighbor_mask":      neighbor_mask,           # (k,)
+            "kalman_pred":        kalman_pred,             # (T_mask, 2)
             "occluded_frames":    mask_len,
             "neighbor_count":     int(neighbor_mask.sum().item()),
             "kalman_uncertainty": torch.tensor(kalman_uncertainty, dtype=torch.float32),
-            "det_score":          torch.tensor(0.0),                        # 가림 중 = 0
+            "det_score":          torch.tensor(0.0),
             "velocity_magnitude": torch.tensor(vel_magnitude, dtype=torch.float32),
         }
 
