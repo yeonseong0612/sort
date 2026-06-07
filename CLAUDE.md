@@ -2,26 +2,27 @@
 
 ## 프로젝트 개요
 
-SORT 기반 Multi-Object Tracking (MOT) 구현체. ByteTrack 스타일의 2-stage association에 Adaptive Kalman Filter(R/Q)와 Detection-level GMC(Global Motion Compensation)를 결합한 트래커.
+SORT 기반 Multi-Object Tracking (MOT) 구현체. ByteTrack 스타일의 2-stage association에 Adaptive Kalman Filter(R/Q), Detection-level GMC(Global Motion Compensation), 이웃 기반 가림 보완(Neighbor Imputation)을 결합한 트래커. 조류 군집 추적을 주요 타겟으로, 외형 Re-ID 없이 운동 정보만으로 동작한다.
 
 ## 디렉토리 구조
 
 ```
 sort/
 ├── CFG/
-│   └── cfg.py                  # 전역 설정 (cfg.device)
+│   └── cfg.py                       # 전역 설정 (cfg.device)
 ├── tracker/
-│   ├── kalman_filter.py        # Adaptive R/Q Kalman Filter
-│   ├── track.py                # Track 객체 및 TrackState 관리
-│   ├── association.py          # IoU cost matrix + lap.lapjv Hungarian matching
-│   ├── motion_statistics.py    # Detection-level GMC
-│   └── tracker.py              # 메인 Tracker 클래스
-├── detector/                   # 미구현 (빈 디렉토리)
-├── evaluation/                 # 미구현 (빈 디렉토리)
-├── ext/                        # 미구현 (빈 디렉토리)
-├── scripts/                    # 미구현 (빈 디렉토리)
-├── visualization/              # 미구현 (빈 디렉토리)
-├── test_synthetic.py           # Adaptive Q 수동 검증 스크립트
+│   ├── kalman_filter.py             # Adaptive R/Q Kalman Filter
+│   ├── track.py                     # Track 객체 및 TrackState 관리
+│   ├── association.py               # IoU cost matrix + lap.lapjv Hungarian matching
+│   ├── motion_statistics.py         # Detection-level GMC
+│   ├── neighbor_imputation.py       # 이웃 기반 가림 위치 보완
+│   └── tracker.py                   # 메인 Tracker 클래스
+├── detector/                        # 미구현 (빈 디렉토리)
+├── evaluation/                      # 미구현 (빈 디렉토리)
+├── ext/                             # 미구현 (빈 디렉토리)
+├── scripts/                         # 미구현 (빈 디렉토리)
+├── visualization/                   # 미구현 (빈 디렉토리)
+└── test_synthetic.py                # Adaptive Q 수동 검증 스크립트
 ```
 
 ## 핵심 설계
@@ -40,13 +41,14 @@ detections (N, 5)
   → KalmanFilter.predict() for all tracked_tracks
   → [GMC] tentative match → median shift → apply_global_shift
   → [1차 association] tracked_tracks ↔ high_dets (IoU + Hungarian)
-      matched   → track.update() → Tracked
+      matched        → track.update() → Tracked
       unmatched track → 2차 association 대기
       unmatched high det → 신규 Track 생성
   → [2차 association] remain_tracks ↔ low_dets
       matched   → track.update() → Tracked
       unmatched → mark_lost → Lost
   → lost_tracks 관리: max_lost 초과 시 mark_removed
+  → [이웃 보완] Lost/OcclusionImputed 트랙에 NeighborImputation.impute()
   → return tracked_tracks (TrackState.Tracked)
 ```
 
@@ -54,7 +56,7 @@ detections (N, 5)
 
 **Adaptive R** (`compute_r_scale`): score 낮음 + area 작음 → R 증가 → 측정 신뢰도 하락
 - `score_scale = clamp(1 / score, 0.5, 5.0)`
-- `area_scale  = clamp(32²/ area, 0.5, 5.0)`  ← ref_area = 32×32
+- `area_scale  = clamp(32² / area, 0.5, 5.0)`  ← ref_area = 32×32
 
 **Adaptive Q** (`compute_q_scale`): innovation 클수록 Q 증가; score 낮으면 팽창 억제
 - `q_scale = clamp(1 + (||innovation_xy|| / 20) × score, 1.0, 10.0)`
@@ -72,13 +74,23 @@ detections (N, 5)
 - `min_pairs`(기본 2) 미만이면 GMC 비활성화
 - `max_shift`(기본 50.0)로 이상치 클램핑
 
+### Neighbor Imputation
+
+가림 발생 시 이웃 트랙들의 운동 정보로 Lost 트랙 위치를 보완.
+- `get_neighbors()`: 유클리드 거리 기준 k개(기본 k=7) 이웃 탐색
+- `compute_neighbor_velocity()`: 이웃들의 평균 `(vx, vy)` 계산
+- `impute()`: `x_imputed = x_kalman + alpha * (v_neighbor - v_self)` (alpha=0.5)
+  - 이웃이 없으면 칼만 예측값으로 자동 폴백
+- 보완된 위치는 `track.imputed_positions`에 누적, 재연결 시 `clear_occlusion()` 호출
+
 ## 트랙 상태 전이
 
 ```
-신규 detection → Track(Tracked)
-Tracked → (매칭 실패) → Lost
-Lost    → (max_lost 프레임 초과) → Removed
-Lost    → (매칭 성공) → Tracked
+신규 detection  → Track(Tracked)
+Tracked         → (매칭 실패)          → Lost
+Lost            → (이웃 보완 적용 중)  → OcclusionImputed
+Lost/OcclusionImputed → (매칭 성공)   → Tracked (clear_occlusion)
+Lost/OcclusionImputed → (max_lost 초과) → Removed
 ```
 
 ## 주요 파라미터 (Tracker 기본값)
@@ -92,6 +104,8 @@ Lost    → (매칭 성공) → Tracked
 | `use_gmc` | True | GMC 활성화 |
 | `gmc_min_pairs` | 2 | GMC 최소 매칭 쌍 수 |
 | `gmc_max_shift` | 50.0 | GMC shift 클램핑 (픽셀) |
+| `imputation.k` | 7 | 이웃 보완에 사용할 이웃 수 |
+| `imputation.alpha` | 0.5 | 이웃 속도 보정 강도 |
 
 ## 의존성
 
@@ -115,7 +129,6 @@ pytest
 ## 미구현 영역
 
 `detector/`, `evaluation/`, `ext/`, `scripts/`, `visualization/` 디렉토리는 현재 비어 있음.
-향후 작업 시 채워야 할 영역:
 - detector: 검출기 연동 (YOLO 등)
 - evaluation: MOT 메트릭 (HOTA, MOTA 등)
 - visualization: 트랙 시각화
@@ -127,37 +140,4 @@ pytest
 - `cfg.device = 'cuda'` 하드코딩 — CPU 환경에서는 `CFG/cfg.py` 수정 필요
 - `association.py`의 `iou_distance`는 GPU 계산 후 `.cpu().numpy()` 반환 (lap이 numpy 요구)
 - `KalmanFilter.update`에서 Q scaling 적용 후 covariance를 **in-place 대입** — 원본 covariance는 변경됨
-
-
-## 개발 방향 (점진적 수정)
-
-### 핵심 원칙
-- 기존 동작 절대 유지 (Adaptive Kalman, 2단계 association, GMC)
-- 칼만 상태벡터 [x,y,w,h,vx,vy,vw,vh] 8차원 그대로 유지
-- 새 기능은 추가만, 기존 로직 수정 최소화
-
-### 1단계 작업 목록
-
-**track.py**
-- TrackState에 OcclusionImputed 추가
-- Track 필드 추가: occluded_frames, imputed_positions,
-  neighbor_ids, last_observed_velocity
-- 메서드 추가: start_occlusion(), add_imputed_position(), clear_occlusion()
-
-**tracker/neighbor_imputation.py (신규)**
-- NeighborImputation 클래스
-- get_neighbors(): 유클리드 거리 기준 k개 이웃 탐색 (기본 k=7)
-- compute_neighbor_velocity(): 이웃 평균 (vx, vy)
-- impute(): 잔차 구조 — 칼만 예측 + 이웃 평균 속도 보정
-  - 이웃 없으면 칼만 예측으로 자동 폴백
-
-**tracker.py**
-- Tracker.__init__에 self.imputation = NeighborImputation(k=7) 추가
-- update() 내 Lost 처리 직후에 이웃 보완 블록 추가
-- Lost → Tracked 재연결 시 clear_occlusion() 호출
-
-### 배경 (연구 컨텍스트)
-- 조류 군집 추적에서 외형 Re-ID 무용 → 운동 기반으로 전환
-- 가림 중 이웃 새들의 변위로 가려진 새 위치 보완
-- 잔차 구조: x_imputed = x_kalman + alpha*(v_neighbor - v_self)
-- alpha=0.5 (초기값, 추후 게이팅 네트워크로 대체 예정)
+- `track.update()` 호출 시 `clear_occlusion()`이 자동 실행 — 재연결 시 별도 호출 불필요
