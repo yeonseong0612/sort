@@ -27,316 +27,350 @@ sort/
 └── test_synthetic.py                # Adaptive Q + 통합 시나리오 검증 스크립트
 ```
 
-## 핵심 설계
+## Phase 1 — 학습 파이프라인 (MLP 게이팅 + k-NN)
 
-### 상태 표현
+### 목표
+게이팅 네트워크(MLP)를 BEE24 데이터로 학습시켜
+"이웃 k-NN 보완이 칼만보다 언제 더 나은가"를 학습.
+k-NN 자체는 학습 없음. MLP만 학습 대상.
 
-- **Kalman 상태 벡터**: `[x, y, w, h, vx, vy, vw, vh]` (8차원)
-- **관측 벡터**: `[x, y, w, h]` (4차원, center 좌표 기준)
-- **입력 detection**: `Tensor (N, 5)` — `[x1, y1, x2, y2, score]` (top-left/bottom-right)
-
-### Tracker.update() 처리 흐름
-
-```
-detections (N, 5)
-  → score split: high_dets (≥ high_thresh) / low_dets (≥ low_thresh)
-  → KalmanFilter.predict() for all tracked_tracks
-  → [GMC] tentative match → median shift → apply_global_shift
-  → [1차 association] tracked_tracks ↔ high_dets (IoU + Hungarian)
-      matched        → track.update() → Tracked
-      unmatched track → 2차 association 대기
-      unmatched high det → 신규 Track 생성
-  → [2차 association] remain_tracks ↔ low_dets
-      matched   → track.update() → Tracked
-      unmatched → mark_lost → Lost
-  → [운동 Re-ID] OcclusionImputed 트랙 ↔ 매칭 안 된 high_dets
-      매칭 성공 → track.update() + clear_occlusion() → Tracked
-      매칭 실패 → 기존 lost 처리 유지
-  → lost_tracks 관리: max_lost 초과 시 mark_removed
-  → [이웃 보완] Lost/OcclusionImputed 트랙에 NeighborImputation.impute()
-      alpha = GatingNetwork.w_neighbor (이웃 없으면 칼만 폴백)
-  → return tracked_tracks (TrackState.Tracked)
-```
-
-### Adaptive Kalman Filter
-
-**Adaptive R** (`compute_r_scale`): score 낮음 + area 작음 → R 증가 → 측정 신뢰도 하락
-- `score_scale = clamp(1 / score, 0.5, 5.0)`
-- `area_scale  = clamp(32² / area, 0.5, 5.0)`  ← ref_area = 32×32
-
-**Adaptive Q** (`compute_q_scale`): innovation 클수록 Q 증가; score 낮으면 팽창 억제
-- `q_scale = clamp(1 + (||innovation_xy|| / 20) × score, 1.0, 10.0)`
-
-**update 내부 순서**:
-1. `project(score, area)` → Adaptive R 적용
-2. innovation 계산
-3. `compute_q_scale(innovation, score)` → covariance 팽창
-4. 팽창된 covariance로 재투영
-5. Cholesky로 Kalman gain 계산 → 상태 보정
-
-### GMC (Detection-level)
-
-픽셀/광학 흐름 없이 매칭된 bbox center shift의 **median**으로 카메라 움직임 추정.
-- `min_pairs`(기본 2) 미만이면 GMC 비활성화
-- `max_shift`(기본 50.0)로 이상치 클램핑
-
-### Neighbor Imputation
-
-가림 발생 시 이웃 트랙들의 운동 정보로 Lost 트랙 위치를 보완.
-- `get_neighbors()`: 유클리드 거리 기준 k개(기본 k=7) 이웃 탐색
-- `compute_neighbor_velocity()`: 이웃들의 평균 `(vx, vy)` 계산
-- `impute(gating=...)`: `x_imputed = x_kalman + alpha * (v_neighbor - v_self)`
-  - alpha = GatingNetwork.w_neighbor (gating 미제공 시 고정값 0.5)
-  - 이웃이 없으면 칼만 예측값으로 자동 폴백
-- 보완된 위치는 `track.imputed_positions`에 누적, 재연결 시 `clear_occlusion()` 호출
-
-### Gating Network
-
-가림 상태에 따라 칼만 운동과 이웃 보완의 신뢰 가중치를 동적으로 결정.
-- 입력 5가지: kalman_uncertainty, detection_score, occluded_frames, neighbor_count, velocity_magnitude
-- 출력: `(w_motion, w_neighbor)` — softmax 정규화, 합 = 1
-- 구조: 2층 MLP (Linear → ReLU → Linear → Softmax), 입력 5 / 은닉 16 / 출력 2
-- 휴리스틱 bias 초기화: 가림 없음 시 w_motion≈0.9 / 이웃 없으면 강제로 w_motion=1.0
-- 추후 end-to-end 학습으로 교체 가능한 구조
-
-### Motion Re-ID
-
-가림 후 재등장한 검출을 보완 궤적 끝점으로 재식별 (외형 없이 운동 패턴 기반).
-- `match(lost_tracks, new_detections)`:
-  1. OcclusionImputed 트랙의 `imputed_positions` 마지막 위치를 끝점으로 사용
-  2. 끝점 ↔ detection 중심점 유클리드 거리 행렬 계산
-  3. Hungarian matching (`lap.lapjv`)
-  4. `max_reid_dist`(기본 50.0 픽셀) 초과 매칭 거부
-- 반환: `[(track_idx, det_idx), ...]`
-
-## 트랙 상태 전이
-
-```
-신규 detection        → Track(Tracked)
-Tracked               → (매칭 실패)              → Lost
-Lost                  → (이웃 보완 적용 중)      → OcclusionImputed
-OcclusionImputed      → (운동 Re-ID 매칭 성공)  → Tracked (clear_occlusion)
-Lost/OcclusionImputed → (1·2차 association 성공) → Tracked (clear_occlusion)
-Lost/OcclusionImputed → (max_lost 초과)          → Removed
-```
-
-## 주요 파라미터 (Tracker 기본값)
-
-| 파라미터 | 기본값 | 역할 |
-|---|---|---|
-| `high_thresh` | 0.5 | 1차 association detection score 임계값 |
-| `low_thresh` | 0.1 | 2차 association detection score 임계값 |
-| `match_thresh` | 0.7 | IoU cost 매칭 임계값 (1-IoU 기준) |
-| `max_lost` | 30 | Lost → Removed까지 허용 프레임 수 |
-| `use_gmc` | True | GMC 활성화 |
-| `gmc_min_pairs` | 2 | GMC 최소 매칭 쌍 수 |
-| `gmc_max_shift` | 50.0 | GMC shift 클램핑 (픽셀) |
-| `imputation.k` | 7 | 이웃 보완에 사용할 이웃 수 |
-| `imputation.alpha` | 0.5 | 이웃 속도 보정 강도 (gating 미사용 시 fallback) |
-| `motion_reid.max_reid_dist` | 50.0 | 운동 Re-ID 최대 허용 거리 (픽셀) |
-
-## 의존성
-
-```python
-torch       # 텐서 연산, GPU 지원
-numpy       # cost matrix 변환
-lap         # lapjv Hungarian matching (lap.lapjv)
-easydict    # cfg 관리
-```
-
-## 실행 방법
-
-```bash
-# Adaptive Q 검증 + 통합 시나리오 3종 실행
-python test_synthetic.py
-
-# pytest (테스트 파일 있을 경우)
-pytest
-```
-
-## 미구현 영역
-
-`detector/`, `evaluation/`, `ext/`, `scripts/`, `visualization/` 디렉토리는 현재 비어 있음.
-- detector: 검출기 연동 (YOLO 등)
-- evaluation: MOT 메트릭 (HOTA, MOTA 등)
-- visualization: 트랙 시각화
-- scripts: 데이터셋별 실행 스크립트
-
-## 주의사항
-
-- `Track._count`는 클래스 변수 — 테스트 간 격리가 필요하면 `Track.reset_id()` 호출
-- `cfg.device = 'cuda'` 하드코딩 — CPU 환경에서는 `CFG/cfg.py` 수정 필요
-- `association.py`의 `iou_distance`는 GPU 계산 후 `.cpu().numpy()` 반환 (lap이 numpy 요구)
-- `KalmanFilter.update`에서 Q scaling 적용 후 covariance를 **in-place 대입** — 원본 covariance는 변경됨
-- `track.update()` 호출 시 `clear_occlusion()`이 자동 실행 — 재연결 시 별도 호출 불필요
-- `GatingNetwork.get_weights()`에서 이웃이 없으면 (w_motion, w_neighbor) = (1.0, 0.0) 강제 반환
-- `MotionReID.match()`는 `imputed_positions`가 있는 트랙만 후보로 사용
-
-## [즉시 수정] tracker.py 버그 2개
-
-### 버그 1 — 가림 첫 프레임 보완 누락
-위치: update() 내 7.5번 블록
-
-현재 코드:
-    for track in lost_tracks:
-        if track.state == TrackState.Lost:
-            track.start_occlusion()
-        if track.state == TrackState.OcclusionImputed:
-            imputed_pos = self.imputation.impute(...)
-            track.add_imputed_position(imputed_pos)
-
-문제: start_occlusion() 호출 후 상태가 OcclusionImputed로 바뀌지만
-      같은 루프의 두 번째 if는 이미 평가가 끝나 실행 안 됨.
-      → 가림 첫 프레임에 보완이 실행되지 않음.
-
-수정:
-    for track in lost_tracks:
-        if track.state == TrackState.Lost:
-            track.start_occlusion()
-        # Lost/OcclusionImputed 모두 보완 실행
-        imputed_pos = self.imputation.impute(
-            track, activated_tracks, self.gating
-        )
-        track.add_imputed_position(imputed_pos)
-
-### 버그 2 — Re-ID 소비 detection 중복 트랙 생성
-위치: update() 내 6번 블록 (unmatched high-score detections → new tracks)
-
-현재 코드 (불안정한 사후 필터링):
-    for d_idx in unmatched_high_dets:
-        det = high_det_tracks[d_idx]
-        activated_tracks.append(det)
-    ...
-    activated_tracks = [
-        t for t in activated_tracks
-        if not (t in unmatched_new_dets and ...)
-    ]
-
-수정 (6번 블록에서 처음부터 건너뜀):
-    for d_idx in unmatched_high_dets:
-        if d_idx in reid_consumed_det_indices:
-            continue  # Re-ID로 소비된 detection 건너뜀
-        det = high_det_tracks[d_idx]
-        activated_tracks.append(det)
-
-    # 사후 필터링 블록 전체 삭제
-
-### 완료 조건
-- python test_synthetic.py 기존 테스트 모두 통과
-- 버그 2개 수정 후 test_synthetic.py에 아래 시나리오 추가:
-  시나리오: 트랙 3개 중 1개 가림(10프레임) →
-  가림 첫 프레임부터 imputed_positions가 쌓이는지 assert로 확인
-
-  
-
-## [신규 구현] 평가 파이프라인 A+C
-
-### 주의사항
-- 코드 작성만 완료 (실행은 서버에서 별도 진행)
-- 데이터 경로 하드코딩 없음 — 전부 argparse로 수신
-- 완료 조건: 코드 작성 + import 오류 없음 확인
-
-### scripts/gt_loader.py 신규 생성
-
-GTLoader 클래스:
-
-__init__(data_dir: str, img_ext=".jpg"):
-    - data_dir: 이미지와 filtered/가 있는 폴더 경로
-    - 이미지 파일 목록 정렬 로드
-    - filtered/*.txt 경로 매핑 (이미지 stem 기준)
-
-__len__(): 총 프레임 수 반환
-
-__getitem__(idx) -> tuple[Path, Tensor]:
-    - 반환: (img_path, gt_boxes)
-    - gt_boxes: Tensor(N, 5) [x1, y1, x2, y2, score=1.0]
-    - YOLO 정규화 좌표 → 픽셀 절대 좌표 변환
-    - 이미지 크기: PIL로 W, H 추출
-    - 객체 없는 프레임: Tensor(0, 5) 반환
+### 검증 질문
+"게이팅 학습 후 고정 alpha=0.5 대비 가림 구간 ADE/FDE가 줄어드는가?"
+→ 줄어들면 Phase 2(GAT)로 진행
+→ 줄어들지 않으면 이웃 집계 방식 재검토
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-### evaluation/mot_eval.py 신규 생성
-
-FrameEvaluator 클래스:
-
-__init__(iou_thresh=0.5)
-
-match_frame(gt_boxes, pred_boxes) -> dict:
-    - gt_boxes:   Tensor(N, 4) [x1,y1,x2,y2]
-    - pred_boxes: Tensor(M, 4) [x1,y1,x2,y2]
-    - IoU 행렬 → Hungarian matching (lap.lapjv)
-    - iou_thresh 미만 매칭 거부
-    - 반환: {tp, fp, fn, matched_ious}
-
-compute_metrics(results: list[dict]) -> dict:
-    - 전체 TP/FP/FN 합산
-    - 반환: {precision, recall, f1, mean_iou}
-
-print_report(metrics: dict): 콘솔 출력
+### 디렉토리 추가
+sort/
+├── data/
+│   └── bee24_loader.py        # BEE24 데이터 로더 + 마스킹
+├── training/
+│   ├── loss.py                # 손실 함수
+│   ├── trainer.py             # 학습 루프
+│   └── train.py               # 실행 스크립트
+└── CFG/
+    └── cfg.py                 # 기존 파일에 Phase 1 설정 추가
+    (configs/phase1.yaml 사용 안 함)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-### visualization/vis_tracks.py 신규 생성
+### data/bee24_loader.py 신규 생성
 
-TrackVisualizer 클래스:
+BEE24Dataset 클래스:
 
-__init__(fps=30, out_path="output.mp4"):
-    - cv2.VideoWriter 초기화 (fourcc: mp4v)
-    - 첫 add_frame 호출 시 해상도 자동 결정
+BEE24 디렉토리 구조:
+    BEE24/
+    ├── train/                    # 31개 시퀀스
+    │   ├── BEE24-01/
+    │   │   ├── gt/gt.txt
+    │   │   ├── img1/
+    │   │   └── seqinfo.ini
+    │   └── BEE24-02/ ...
+    └── test/                     # 별도 시퀀스
 
-add_frame(img_path, gt_boxes, tracked_tracks, lost_tracks):
-    오버레이:
-    - GT 박스:                초록색(0,255,0) 실선 두께 1
-    - Tracked 트랙:           파란색(255,100,0) 실선 두께 2
-                              좌상단 track_id 텍스트
-    - OcclusionImputed 트랙:  빨간색(0,0,255) 점선 두께 2
-                              "IMP:{id}" 텍스트
-    - imputed_positions 궤적: 노란색(0,255,255) 점 연결
+gt.txt 형식 (9열, 콤마 구분):
+    frame_id, track_id, x, y, w, h, 1, 1, 1
+    - frame_id: 6자리 문자열 ("000001" → int 1)
+    - x, y: top-left 픽셀 좌표 (float)
+    - w, h: 픽셀 단위 (float)
+    - 예: 000001,1,448.00,331.00,57.00,60.00,1,1,1
 
-release(): VideoWriter 해제
+seqinfo.ini 파싱 항목:
+    frameRate=25
+    imWidth=950
+    imHeight=590
+
+__init__(data_root, split="train",
+         mask_lengths=[5, 10, 20, 40],
+         mask_ratio=0.3,
+         min_track_len=30,
+         k=7,
+         val_seq_ids=None):
+    - data_root: BEE24 루트 폴더
+    - split: "train" / "val" / "test"
+    - val_seq_ids: 검증 시퀀스 ID 리스트
+                   None이면 train 31개 중 마지막 6개를 val로 사용
+    - mask_lengths: 마스킹 길이 후보 (프레임 단위)
+    - mask_ratio: 트랙당 최대 마스킹 비율
+    - min_track_len: 이 길이 미만 트랙 제외
+    - k: 이웃 수
+
+데이터 로드 순서:
+    1. split에 맞는 시퀀스 폴더 목록 구성
+       train: 전체 31개 중 val 제외
+       val:   val_seq_ids 또는 마지막 6개
+       test:  BEE24/test/ 폴더
+    2. 각 시퀀스별 seqinfo.ini 파싱
+       → fps, imWidth, imHeight 추출
+    3. gt.txt 파싱:
+       - parts = line.strip().split(",")
+       - frame_id = int(parts[0])
+       - track_id = int(parts[1])
+       - x, y, w, h = float(parts[2]), float(parts[3]),
+                       float(parts[4]), float(parts[5])
+       - cx = x + w/2  (top-left → center 변환)
+       - cy = y + h/2
+    4. {track_id: [(frame, cx, cy, w, h), ...]} 구성
+       (시퀀스별로 track_id가 겹칠 수 있으므로
+        키를 (seq_name, track_id)로 관리)
+    5. 속도 계산 (fps 반영):
+       vx = (cx[t] - cx[t-1]) * fps
+       vy = (cy[t] - cy[t-1]) * fps
+       첫 프레임 속도 = 0
+    6. min_track_len 미만 트랙 제외
+    7. 마스킹 샘플 인덱스 사전 생성
+
+__len__(): 전체 마스킹 샘플 수 반환
+
+__getitem__(idx) -> dict:
+    반환 딕셔너리:
+    {
+      "target_before":  Tensor(T_obs, 6),     # 가림 전 궤적 [cx,cy,vx,vy,w,h]
+      "target_gt":      Tensor(T_mask, 2),    # 가림 구간 GT [cx,cy]
+      "neighbors":      Tensor(k, T_mask, 4), # 이웃 궤적 [cx,cy,vx,vy]
+                                              # 이웃 없으면 zeros
+      "neighbor_mask":  Tensor(k,),           # 실제 이웃 여부 (1/0)
+      "kalman_pred":    Tensor(T_mask, 2),    # 칼만 예측 [cx,cy]
+      "occluded_frames": int,                 # 마스킹 길이
+      "neighbor_count": int,                  # 실제 이웃 수
+      "kalman_uncertainty": float,            # 칼만 공분산 trace (게이팅 입력)
+      "velocity_magnitude": float,            # 가림 직전 속도 크기 (게이팅 입력)
+    }
+
+마스킹 프로토콜:
+    1. 트랙에서 마스킹 시작점 랜덤 선택
+       유효 범위: [10, len(track) - mask_len - 10]
+       (앞뒤 10프레임은 관측 확보용으로 제외)
+    2. mask_lengths에서 길이 랜덤 선택
+       단, 해당 트랙 길이의 mask_ratio 이하로 제한
+    3. 마스킹 구간의 이웃 탐색:
+       같은 시퀀스, 같은 프레임 구간에 존재하는 다른 track_id
+       거리 기준 상위 k개 선택
+       (거리 = 마스킹 시작 프레임에서의 중심점 유클리드 거리)
+    4. 칼만 예측 계산 (등속도 외삽):
+       vx_last, vy_last = 가림 직전 프레임 속도
+       cx_kalman(t) = cx_last + vx_last * t  (t=1,2,...,T_mask)
+       cy_kalman(t) = cy_last + vy_last * t
+    5. kalman_uncertainty:
+       가림 길이에 비례해 증가하는 단순 추정값 사용
+       uncertainty = base_var * (1 + occluded_frames * 0.1)
+       (실제 KalmanFilter 없이 근사값으로 대체)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-### scripts/run_eval.py 신규 생성
+### training/loss.py 신규 생성
+
+OcclusionImputationLoss 클래스:
+
+__init__(lambda_fde=2.0, alpha_gate=1.0, beta_reg=0.01):
+    - lambda_fde: FDE 가중치 (재등장 위치 정합 중요)
+    - alpha_gate: 게이팅 손실 가중치
+    - beta_reg: 정규화 가중치
+
+forward(pred, gt, w_neighbor, kalman_pred, neighbor_mask) -> dict:
+    입력:
+    - pred:          Tensor(B, T, 2) 최종 복원 위치
+    - gt:            Tensor(B, T, 2) GT 위치
+    - w_neighbor:    Tensor(B,)      게이팅 출력 이웃 가중치
+    - kalman_pred:   Tensor(B, T, 2) 칼만 예측
+    - neighbor_mask: Tensor(B,)      이웃 존재 여부
+
+    계산:
+    # ADE: 가림 구간 평균 변위 오차
+    L_ADE = mean(||pred - gt||_2)  over T
+
+    # FDE: 마지막 프레임 오차 (재등장 위치)
+    L_FDE = ||pred[:,-1,:] - gt[:,-1,:]||_2
+
+    # GNN 손실
+    L_impute = L_ADE + lambda_fde * L_FDE
+
+    # 게이팅 손실:
+    # 이웃 없는 샘플에서 w_neighbor가 0에 가깝도록
+    L_gate = mean(w_neighbor[neighbor_mask==0] ** 2)
+
+    # 정규화: w_neighbor 과신뢰 방지
+    L_reg = mean(w_neighbor ** 2)
+
+    # 전체 손실
+    L_total = L_impute + alpha_gate * L_gate + beta_reg * L_reg
+
+    반환: {
+        "total": L_total,
+        "ade": L_ADE,
+        "fde": L_FDE,
+        "gate": L_gate,
+        "reg": L_reg
+    }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+### training/trainer.py 신규 생성
+
+Trainer 클래스:
+
+__init__(config):
+    - GatingNetwork 초기화
+    - NeighborImputation(k=7) 초기화 (고정, 학습 안 함)
+    - optimizer: Adam(gating.parameters(), lr=1e-3)
+    - scheduler: CosineAnnealingLR
+    - loss_fn: OcclusionImputationLoss
+
+train_epoch(dataloader) -> dict:
+    배치별 루프:
+    1. 배치에서 데이터 로드
+    2. k-NN 이웃 평균 속도 계산 (고정)
+       v_neighbor = mean(neighbors velocity)
+    3. 게이팅 가중치 계산
+       w_motion, w_neighbor = gating.get_weights_batch(batch)
+    4. 최종 복원 위치 계산
+       pred = w_motion * kalman_pred +
+              w_neighbor * (kalman_pred + alpha*(v_neighbor - v_self))
+    5. 손실 계산 및 역전파
+    6. 손실 기록
+
+    반환: {ade, fde, total_loss} 평균
+
+evaluate(dataloader) -> dict:
+    검증 루프 (no_grad):
+    가림 길이별 ADE/FDE 분리 측정
+    {5프레임: {ade, fde}, 10프레임: ..., 20프레임: ..., 40프레임: ...}
+
+save_checkpoint(epoch, path): 모델 저장
+load_checkpoint(path): 모델 로드
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+### gating_network.py 수정 — 배치 처리 추가
+
+기존 get_weights()는 단일 트랙 처리.
+학습용 배치 처리 메서드 추가:
+
+get_weights_batch(batch: dict) -> tuple[Tensor, Tensor]:
+    입력: __getitem__ 반환 딕셔너리의 배치
+    출력: w_motion (B,), w_neighbor (B,)
+
+    입력 벡터 구성 (배치):
+    x = stack([
+        batch["kalman_uncertainty"] / 500.0,
+        batch["det_score"],          # 가림 중 = 0.0
+        batch["occluded_frames"] / 30.0,
+        batch["neighbor_count"] / 8.0,
+        batch["velocity_magnitude"] / 20.0,
+    ], dim=1)  # (B, 5)
+
+    forward(x) → (B, 2) softmax
+    이웃 없는 샘플은 강제로 (1.0, 0.0) 처리
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+### training/train.py 신규 생성
 
 argparse 인자:
-    --data_dir    필수, 데이터 폴더 경로
-    --iou_thresh  기본 0.5
-    --out_dir     기본 eval_output/
-    --save_video  플래그, 시각화 영상 저장
-    --max_frames  기본 None (전체)
-    --device      기본 cuda
+    --data_root    BEE24 루트 경로 (필수)
+    --out_dir      체크포인트 저장 경로 (기본 checkpoints/)
+    --epochs       학습 에폭 (기본 50)
+    --batch_size   배치 크기 (기본 64)
+    --lr           학습률 (기본 1e-3)
+    --k            이웃 수 (기본 7)
+    --val_ratio    검증 분할 비율 (기본 0.2)
+    --device       cuda / cpu (기본 cuda)
+    --seed         재현성 시드 (기본 42)
 
 실행 흐름:
-    1. GTLoader 초기화
-    2. Tracker 초기화 (device 인자 반영)
-    3. FrameEvaluator, TrackVisualizer 초기화
-    4. 프레임별 루프:
-        a. gt_boxes → Tracker.update(gt_boxes)
-        b. FrameEvaluator.match_frame(gt, pred)
-        c. save_video → TrackVisualizer.add_frame()
-        d. 100프레임마다 중간 지표 콘솔 출력
-    5. compute_metrics → print_report
-    6. out_dir/metrics.txt 저장
-    7. save_video → visualizer.release()
+    1. BEE24Dataset 초기화 (train / val 분할)
+    2. DataLoader 구성 (shuffle=True, num_workers=4)
+    3. Trainer 초기화
+    4. 에폭 루프:
+        a. train_epoch()
+        b. evaluate()
+        c. 10 에폭마다 체크포인트 저장
+        d. val ADE 기준 best 모델 저장
+        e. 콘솔 출력:
+           [Epoch 10/50] Loss=0.123 ADE=12.3 FDE=18.5
+           Val: ADE(5f)=8.2 ADE(10f)=12.1 ADE(20f)=19.4
+    5. 학습 완료 후 best 모델 로드
+    6. 가림 길이별 최종 성능 출력 및 저장
 
-out_dir/
-├── metrics.txt
-└── tracks.mp4  (--save_video 시)
+결과 저장:
+    out_dir/
+    ├── best_model.pth       ← val ADE 기준 최적
+    ├── last_model.pth       ← 마지막 에폭
+    └── train_log.csv        ← 에폭별 손실 기록
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-### 완료 조건
+### CFG/cfg.py 수정 — Phase 1 설정 추가
+
+기존 cfg.py에 phase1 설정 블록을 추가한다.
+yaml 미사용. EasyDict으로 기존 방식과 통일.
+
+추가할 내용:
+
+from easydict import EasyDict as edict
+
+# 기존 cfg (device 등) 유지하고 아래 추가
+cfg.phase1 = edict()
+
+# 데이터
+cfg.phase1.data = edict()
+cfg.phase1.data.data_root       = ""          # 실행 시 argparse로 덮어씀
+cfg.phase1.data.mask_lengths    = [5, 10, 20, 40]
+cfg.phase1.data.mask_ratio      = 0.3
+cfg.phase1.data.min_track_len   = 30
+cfg.phase1.data.k               = 7
+cfg.phase1.data.val_ratio       = 0.2
+
+# 모델
+cfg.phase1.model = edict()
+cfg.phase1.model.input_dim      = 5
+cfg.phase1.model.hidden_dim     = 16
+cfg.phase1.model.output_dim     = 2
+cfg.phase1.model.alpha_fallback = 0.5         # 게이팅 없을 때 fallback
+
+# 손실
+cfg.phase1.loss = edict()
+cfg.phase1.loss.lambda_fde      = 2.0         # FDE 가중치
+cfg.phase1.loss.alpha_gate      = 1.0         # 게이팅 손실 가중치
+cfg.phase1.loss.beta_reg        = 0.01        # 정규화 가중치
+
+# 학습
+cfg.phase1.train = edict()
+cfg.phase1.train.epochs         = 50
+cfg.phase1.train.batch_size     = 64
+cfg.phase1.train.lr             = 1e-3
+cfg.phase1.train.scheduler      = "cosine"
+cfg.phase1.train.seed           = 42
+
+# training/train.py에서 사용 예시:
+# from CFG.cfg import cfg
+# data_root = args.data_root or cfg.phase1.data.data_root
+# epochs    = args.epochs    or cfg.phase1.train.epochs
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+### 완료 조건 (WSL — 데이터 없이 import만 확인)
+
+# 데이터셋 없이 코드 구조만 검증
 python -c "
-from scripts.gt_loader import GTLoader
-from evaluation.mot_eval import FrameEvaluator
-from visualization.vis_tracks import TrackVisualizer
-from tracker.tracker import Tracker
+from CFG.cfg import cfg
+from data.bee24_loader import BEE24Dataset
+from training.loss import OcclusionImputationLoss
+from training.trainer import Trainer
+print('cfg.phase1.train.epochs:', cfg.phase1.train.epochs)
 print('All imports OK')
 "
-위 명령이 오류 없이 통과해야 함.
 
-### 유지할 것
-- tracker/ 코드 수정 없음
-- test_synthetic.py 통과 유지
+# 실제 학습 실행은 서버에서 BEE24 데이터 준비 후 진행
+# python training/train.py \
+#     --data_root /path/to/BEE24 \
+#     --out_dir checkpoints/phase1 \
+#     --device cuda
+
+### 주의사항
+- WSL에서는 코드 작성 + import 확인까지만
+- 데이터셋(BEE24)은 서버에만 존재
+- 학습 실행은 서버에서 직접 수행
+- train.py의 --data_root는 argparse 필수 인자로 두되
+  cfg.phase1.data.data_root를 기본값 참조로 사용

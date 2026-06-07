@@ -15,7 +15,9 @@
       "Bash(pip show *)",
       "Bash(conda info *)",
       "Bash(conda env *)",
-      "Bash(/home/yskim/miniconda3/envs/sort/bin/python *)"
+      "Bash(/home/yskim/miniconda3/envs/sort/bin/python *)",
+      "Bash(pip install *)",
+      "Bash(pip3 show *)"
     ]
   }
 }

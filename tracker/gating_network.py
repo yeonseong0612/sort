@@ -47,6 +47,46 @@ class GatingNetwork(nn.Module):
         x = self.fc2(x)
         return torch.softmax(x, dim=-1)
 
+    def get_weights_batch(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        DataLoader 배치에서 (w_motion, w_neighbor) 텐서를 반환.
+        neighbor_mask == 0인 샘플은 강제로 (1.0, 0.0) 처리.
+
+        입력: BEE24Dataset.__getitem__ 반환 딕셔너리의 배치
+        출력: w_motion (B,), w_neighbor (B,)
+        """
+        device = next(self.parameters()).device
+
+        kalman_uncertainty = batch["kalman_uncertainty"].to(device)   # (B,)
+        det_score          = batch["det_score"].to(device)            # (B,)
+        occluded_frames    = batch["occluded_frames"].to(device) if torch.is_tensor(batch["occluded_frames"]) \
+                             else torch.tensor(batch["occluded_frames"], dtype=torch.float32, device=device)
+        neighbor_count     = batch["neighbor_count"].to(device) if torch.is_tensor(batch["neighbor_count"]) \
+                             else torch.tensor(batch["neighbor_count"], dtype=torch.float32, device=device)
+        vel_mag            = batch["velocity_magnitude"].to(device)   # (B,)
+        neighbor_mask      = batch["neighbor_mask"].to(device)        # (B, k)
+
+        # neighbor_mask: 하나라도 이웃 있으면 1
+        has_neighbor = (neighbor_mask.sum(dim=-1) > 0).float()        # (B,)
+
+        x = torch.stack([
+            kalman_uncertainty / 500.0,
+            det_score,
+            occluded_frames.float() / 30.0,
+            neighbor_count.float() / 8.0,
+            vel_mag / 20.0,
+        ], dim=1)  # (B, 5)
+
+        weights = self.forward(x)          # (B, 2)
+        w_motion   = weights[:, 0]         # (B,)
+        w_neighbor = weights[:, 1]         # (B,)
+
+        # 이웃 없는 샘플 강제 처리
+        w_motion   = torch.where(has_neighbor.bool(), w_motion,   torch.ones_like(w_motion))
+        w_neighbor = torch.where(has_neighbor.bool(), w_neighbor, torch.zeros_like(w_neighbor))
+
+        return w_motion, w_neighbor
+
     def get_weights(self, track, active_tracks) -> tuple[float, float]:
         """
         track과 active_tracks 정보로 입력 벡터를 구성해 (w_motion, w_neighbor) 반환.
