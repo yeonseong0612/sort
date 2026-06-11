@@ -46,31 +46,16 @@ class TrackVisualizer:
             cv2.putText(img, str(track.track_id), (x1, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 1)
 
-        # OcclusionImputed tracks (red dashed, thickness 2) + imputed trajectory (yellow dots)
+        # Lost tracks (red dashed, thickness 2) — 칼만 예측 위치
         for track in lost_tracks:
-            if track.state != TrackState.OcclusionImputed:
+            if track.state != TrackState.Lost:
                 continue
 
             tlbr = track.to_tlbr().cpu().numpy()
             x1, y1, x2, y2 = map(int, tlbr)
             self._draw_dashed_rect(img, x1, y1, x2, y2, (0, 0, 255), 2)
-            cv2.putText(img, f"IMP:{track.track_id}", (x1, y1 - 4),
+            cv2.putText(img, f"LOST:{track.track_id}", (x1, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-            # imputed trajectory
-            pts = track.imputed_positions
-            if len(pts) > 1:
-                for i in range(1, len(pts)):
-                    p1 = pts[i - 1]
-                    p2 = pts[i]
-                    if isinstance(p1, torch.Tensor):
-                        p1 = p1.cpu().numpy()
-                    if isinstance(p2, torch.Tensor):
-                        p2 = p2.cpu().numpy()
-                    p1 = (int(p1[0]), int(p1[1]))
-                    p2 = (int(p2[0]), int(p2[1]))
-                    cv2.line(img, p1, p2, (0, 255, 255), 1)
-                    cv2.circle(img, p2, 2, (0, 255, 255), -1)
 
         self.writer.write(img)
 

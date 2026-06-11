@@ -29,7 +29,16 @@
       "Bash(conda activate *)",
       "Bash(python3 -c \"import torch; print\\(torch.__version__\\)\")",
       "Bash(python3 *)",
-      "Bash(/home/yskim/miniconda3/envs/sort/bin/python3 *)"
+      "Bash(/home/yskim/miniconda3/envs/sort/bin/python3 *)",
+      "Bash(git -C /home/yskim/projects/sort rev-parse --git-common-dir)",
+      "Bash(git -C /home/yskim/projects/sort rev-parse --git-dir)",
+      "Bash(mkdir -p /home/yskim/projects/sort/.understand-anything/intermediate)",
+      "Bash(mkdir -p /home/yskim/projects/sort/.understand-anything/tmp)",
+      "Bash(npm --version)",
+      "Bash(npm install *)",
+      "Bash(node *)",
+      "Bash(git rm *)",
+      "Bash(echo \"exit:$?\")"
     ]
   }
 }
